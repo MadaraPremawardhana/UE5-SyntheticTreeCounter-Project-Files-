@@ -1,106 +1,119 @@
-# UE Aerial Tree Counter (Cesium for Unreal + Python/OpenCV)
+# UE Crowd Gender Counter (Unreal Engine + Python/OpenCV 5 ONNX)
 
-Geolocate to any latitude/longitude in Unreal Engine, capture the Cesium 3D
-Tiles aerial view from above, and automatically count and box every tree
-visible in the capture — no training data, no model weights, running
-entirely in-editor via Unreal's Python Editor Script Plugin.
+Capture any crowd scene in Unreal Engine and automatically detect every
+visible face, classify its visual gender presentation (Male/Female), and
+report the counts back to Blueprint — with **zero manual model downloads**
+and **zero model files checked into your project**. The entire pipeline is
+OpenCV 5.x-native ONNX, running in-editor via Unreal's Python Editor
+Script Plugin.
 
-| Crystal-forest test capture | Real-world capture (Google Maps tiles via Cesium ion) |
+| Raw capture | Labeled output (3 faces, all classified) |
 |---|---|
-| ![raw](docs/screenshots/capture-crystalforest-raw.png) | ![raw](docs/screenshots/capture-town-raw.png) |
-| ![labeled](docs/screenshots/capture-crystalforest-labeled.png) | ![labeled](docs/screenshots/capture-town-labeled.png) |
-| **1,259 trees detected** | **743 trees detected** |
+| ![raw](docs/screenshots/capture-crowd-raw.png) | ![labeled](docs/screenshots/capture-crowd-labeled.png) |
+
+## Why this exists: OpenCV 5 killed the old approach
+
+The classic recipe for this (Levi & Hassner `gender_net.caffemodel` + the
+`opencv_face_detector_uint8.pb` ResNet-SSD) is **dead on OpenCV 5.0** —
+both the Caffe *and* TensorFlow DNN importers were removed, so
+`cv2.dnn.readNet` fails on those files with
+`Caffe importer has been removed`. This project is the drop-in
+replacement: two ONNX models, loaded with `cv2.dnn.readNetFromONNX` /
+`cv2.FaceDetectorYN`, with the same stdout contract your Blueprints
+already expect.
+
+## What's novel
+
+- **No `models/` folder.** Both ONNX weights live on GitHub; on first run
+  `gender.py` downloads them from pinned URLs into a local cache
+  (`Content/Python/_model_cache/`) and reuses them forever. First run
+  needs internet; every run after is fully offline. Swap two URL
+  constants to point at your own mirrored weights.
+- **OpenCV 5.x-correct YuNet.** Uses the dynamic-input-shape
+  `face_detection_yunet_2026may.onnx` build — the fixed-shape 2023mar
+  file misbehaves with the OpenCV 5 DNN engine.
+- **Verified gender polarity.** The genderage model emits
+  `[female_score, male_score, age]`; index **1 = Male, 0 = Female** (per
+  the upstream author's documented convention), so counts can't silently
+  invert.
+- **Blueprint-native I/O contract.** `run_from_path()` prints exactly one
+  line — `M,F` (e.g. `0,3`) or `-1,-1` on failure — nothing else on
+  stdout. Details go to `unreal.log_error()` (Output Log), not the pipe
+  your Blueprint parses.
+- **Non-blocking screenshot readiness.** `Take High Res Screenshot`
+  returns before the PNG finishes writing. `check_screenshot_ready()` is
+  an instant, stateful size-stability check (safe to call from a
+  Blueprint Delay-poll loop) — the script never sleeps, never freezes
+  the editor.
 
 ## How it works
 
-The pipeline is three Blueprints handing off to one Python script:
+The pipeline is one Blueprint flow handing off to one Python script:
 
-1. **Go to a location** (`LocateToLocation` actor) — a widget takes a
-   latitude/longitude, and a `Custom Event` on this actor calls
-   `Move To Longitude Latitude Height` on its `Cesium Globe Anchor`
-   component, teleporting it (and the camera) to that point on the globe.
-   Cesium's tileset streams in the terrain/imagery around the new position.
+1. **Capture** — `Take High Res Screenshot` saves a timestamped PNG. The
+   Blueprint polls `check_screenshot_ready(path)` (via `Execute Python
+   Command` + a Delay node) until the file size stops changing.
 
-   ![Teleport blueprint](docs/screenshots/bp-teleport-to-location.png)
+2. **Count** — a final `Execute Python Command (Advanced)` runs, in
+   **Execute Statement** mode:
 
-2. **Capture the scene** (`Widget BP`) — a "Photo" button fires
-   `Take High Res Screenshot`, saving a PNG to disk with a timestamped
-   filename.
+   ```python
+   import importlib, gender
+   importlib.reload(gender)
+   gender.run_from_path(r"<CapturedPhotoPath>")
+   ```
 
-   ![Widget blueprint](docs/screenshots/bp-widget-goto.png)
+   Blueprint reads the `Log Output` string, `Split String` on `",`, and
+   `String → Int` each half.
 
-3. **Count the trees** (`ML_Actor_treecount` actor, `CountTrees` event) —
-   builds a one-line Python statement (import the counting module, call it
-   with the screenshot's path) and runs it via `Execute Python Command
-   (Advanced)` in **Execute Statement** mode. The script prints a single
-   bare integer — the tree count — which Blueprint reads back out of the
-   node's `Log Output` array and converts straight to an `Int`.
+3. **Detect faces** — YuNet (`cv2.FaceDetectorYN`) with score threshold
+   `0.6`, NMS `0.3`, and a 20 px minimum-face filter to reject noise.
 
-   ![Count Trees blueprint](docs/screenshots/bp-count-trees.png)
+4. **Classify gender** — each face box is center-crop aligned
+   (scale = `224 / (max(w,h)·1.5)`, per the upstream reference impl),
+   fed to the ~1 MB `genderage.onnx` at 224×224 (BGR→RGB, zero mean),
+   and labeled by `argmax` of the two gender scores.
 
-### The counting algorithm (`tree_counter_ue.py`)
-
-Classical computer vision, not a trained model:
-
-1. **Segment canopy from ground** — threshold the HSV *saturation*
-   channel (tree canopy reads as saturated color; bare ground/rock/road
-   reads as desaturated white/tan), then clean up the mask with
-   morphological open/close.
-2. **Find tree tops** — each tree's sunlit tip is a local brightness
-   peak; `skimage.feature.peak_local_max` finds all such peaks inside the
-   canopy mask, spaced a minimum distance apart.
-3. **Split touching canopies** — a marker-controlled watershed
-   (`skimage.segmentation.watershed`), seeded at those peaks, splits the
-   canopy mask into one region per tree, even where crowns visually
-   overlap.
-4. **Filter and count** — regions that are too small (noise) or
-   implausibly large (undersegmented clumps) are discarded; everything
-   left gets a bounding box, and the count is the number of surviving
-   regions.
-
-No ground-truth training set, no GPU inference — just OpenCV + scikit-image,
-tuned against the example captures above.
+5. **Report** — counts printed as `M,F`; a labeled copy
+   (`<name>_labeled.png`) and optional JSON of every box are written next
+   to the capture.
 
 ## Setup
 
-1. Install the **Cesium for Unreal** plugin and get a scene georeferenced
-   and streaming (tileset + `CesiumGeoreference` in your level).
-2. Enable **Python Editor Script Plugin** (Edit → Plugins).
-3. Install the Python dependencies into Unreal's *own* bundled Python
-   interpreter (not your system Python) — find its path from the
-   in-editor Python console with `import sys; print(sys.executable)`,
-   then:
+1. Enable **Python Editor Script Plugin** (Edit → Plugins).
+2. Install dependencies into Unreal's *own* bundled Python interpreter
+   (find it with `import sys; print(sys.executable)` in the Python
+   console), then:
    ```
-   "<path from above>" -m pip install opencv-python numpy scipy scikit-image
+   "<path from above>" -m pip install "opencv-python>=5" numpy
    ```
-4. Drop `tree_counter_ue.py` into `<YourProject>/Content/Python/`
-   (Unreal auto-adds that folder to `sys.path`).
-5. Build the three Blueprints as described above (or adapt your own —
-   the only hard requirement is that something calls
-   `tree_counter_ue.run_from_path(<image path>)` via `Execute Python
-   Command (Advanced)` in **Execute Statement** mode, after the
-   screenshot has actually finished writing to disk).
+3. Drop `gender.py` into `<YourProject>/Content/Python/`. That's it — no
+   model files, no `models/` folder. The first `run_from_path` call
+   downloads ~1.2 MB of ONNX weights from GitHub automatically.
+   (Air-gapped machine? Download the two URLs at the top of `gender.py`
+   manually into `Content/Python/_model_cache/`.)
+4. Build the Blueprint: Delay-poll `check_screenshot_ready()`, then call
+   the one-liner above via `Execute Python Command (Advanced)`.
 
 ## Known limitations
 
-- **Heuristic, not a trained detector.** It works well on imagery where
-  each tree has a visible highlight/shadow separating it from its
-  neighbors (true of both examples above). Flatter lighting, a different
-  color palette, or much denser canopy will need the tunables at the top
-  of `tree_counter_ue.py` (`SAT_THRESH`, `MIN_TREE_PX`, `MIN_BLOB_AREA`,
-  `MAX_BLOB_AREA_FRAC`) retuned, or ultimately a trained model swapped in.
-- **Editor-only.** This uses Unreal's Python Editor Script Plugin, which
-  doesn't exist in a packaged/shipping build. Running this in a shipped
-  game would mean porting the algorithm to C++ or bundling a portable
-  Python distribution and shelling out to it.
-- **Screenshot capture is asynchronous.** `Take High Res Screenshot`
-  returns before the file is finished writing; the Blueprint has to wait
-  (a Delay, or a poll loop) before handing the path to Python, or the
-  read will fail.
+- **Estimate, not ground truth.** This classifies *visual facial
+  presentation* with a small CNN trained on real photos. MetaHuman /
+  stylized crowd characters shift the distribution — expect lower
+  confidence (the example above: 22–47%) and spot-check before trusting
+  counts for anything beyond rough QA.
+- **Faces under ~20 px are skipped** (tunable via `MIN_FACE_PX`), and
+  profile/strongly turned heads may be missed by the detector.
+- **Editor-only.** The Python Editor Script Plugin doesn't ship in
+  packaged builds; a shipped game would need a C++ port or a bundled
+  Python runtime.
+- **First run needs internet** for the one-time model download.
 
 ## Repo layout
 
 ```
-Content/Python/tree_counter_ue.py   # the counting algorithm + Blueprint entry point
-docs/screenshots/                   # blueprint graphs + example captures (this README)
+Content/Python/gender.py            # detection + classification + Blueprint entry point
+docs/screenshots/
+  capture-crowd-raw.png             # unannotated crowd capture
+  capture-crowd-labeled.png         # boxed + classified output ("Male: 0  Female: 3  Total: 3")
 ```
